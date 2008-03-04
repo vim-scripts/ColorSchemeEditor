@@ -1,0 +1,50 @@
+This is a mirror of http://www.vim.org/scripts/script.php?script_id=2180
+
+This plugin provides a GUI tool which simplifies creating/editing Vim
+colorscheme files.  It consists of a Vim plugin as well as a Python program,
+and utilizes Vim's command server interface |clientserver| for communications.
+
+New in version 1.1:
+The list of highlight groups now displays a swatch of the current foreground/
+background colors.  You can see right away which colors are used for each
+highlight group.  
+After getting some negative feedback over my last few colorscheme contributions,
+I have added a readability column to this tool that analyses the color contrast 
+between foreground and background colors.  I hope that this will lead to 
+colorschemes that are easy on the eyes for all Vim users.
+
+See the screenshots:
+
+http://i49.servimg.com/u/f49/12/09/64/12/metada10.jpg
+http://i49.servimg.com/u/f49/12/09/64/12/colors10.png
+
+The goals that I hope to achieve through this plugin are to improve the
+quality of existing colorschemes by allowing the authors the freedom to create
+colorschemes in a natural WYSIWYG fashion.  Immediate visual feedback lets the
+author quickly assess the effects of their changes, and allows them to easily
+choose just the right color for a highlight element.  By displaying all of the
+"preferred" highlight groups in a treeview, colorscheme authors can ensure
+that all of the important highlights have been changed to fit in with the
+overall scheme.  Users of colorschemes can use this plugin to tweak their
+favorite colorschemes more to their liking.
+
+Colorschemes generated with this plugin are backwards-compatible with earlier
+versions of Gvim that do not use such highlight groups as CursorLine or Pmenu.
+
+Your palette of custom colors is saved in the colorscheme file, so that your
+choices persist between editing sessions.  This helps you maintain
+a consistent look-and-feel while you are in the process of creating the
+colorscheme.  Other metadata related to the colorscheme, such as licensing
+information and your contact information are accessible from within the editor
+as well.
+
+This plugin makes a nice compliment to my earlier work, ColorSchemeMenuMaker.
+    http://www.vim.org/scripts/script.php?script_id=2004
+
+If you have already installed ColorSchemeMenuMaker, the menu entry for
+ColorSchemeEditor will appear at the bottom of the "ColorSchemes" menu item.
+Additionally, you may invoke it via the :ColorSchemeEditor command.
+
+Send bugs, suggestions, flames, etc. to NOSPAMewfalor@NOSPAMgmail.com - NOSPAM.
+
+
