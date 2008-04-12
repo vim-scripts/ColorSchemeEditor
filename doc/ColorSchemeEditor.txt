@@ -1,8 +1,8 @@
 *ColorSchemeEditor.txt* PyGTK interface to :highlight commands
 
-Last changed:   2008-03-04
+Last changed:   2008-04-12
 Maintainer:     Erik Falor <ewfalor@gmail.com>
-Version:        1.0.1 beta
+Version:        1.1
 License:        Licensed under the same terms as Vim
 
 
@@ -12,6 +12,7 @@ License:        Licensed under the same terms as Vim
 
     1. Contents                        : |ColorSchemeEditor-contents|
     2. QuickStart                      : |ColorSchemeEditor-quickstart|
+      2.1 What's New                   : |ColorSchemeEditor-whatsnew|
     3. Installation                    : |ColorSchemeEditor-install|
       3.1 Requirements                 : |ColorSchemeEditor-requirements|
       3.2 Instructions                 : |ColorSchemeEditor-instructions|
@@ -61,6 +62,24 @@ Additionally, you may invoke it via the :ColorSchemeEditor command.
 Each instance of the editor is connected to at most one running instance of
 Gvim.
 
+------------------------------------------------------------------------------
+2.1 What's New                                    *ColorSchemeEditor-whatsnew*
+
+Version 1.1
+* Foreground and background colors are displayed as swatches in the TreeView.
+
+* Foreground and background color combinations for each highlight group are
+  analysed for readability.  The color contrast and color difference
+  algorithms used are published by the W3C:
+    http://www.w3.org/TR/AERT#color-contrast
+    http://www.w3.org/TR/WCAG20-GENERAL/G17.html    7:1 contrast ratio
+    http://www.w3.org/TR/WCAG20-GENERAL/G18.html    5:1 contrast ratio
+
+  An implementation of the first algorithm:
+    http://snook.ca/technical/colour_contrast/colour.html
+
+* Display rgb.txt colors database in an auxiliary window.
+
 
 ==============================================================================
 3. Installation                                    *ColorSchemeEditor-install*
@@ -79,6 +98,8 @@ packages and their dependencies installed.
 
 More specifically, Gentoo users will need at least the following packages:
 dev-lang/python x11-libs/gtk+ gnome-base/libglade dev-python/pygtk
+
+Ubuntu users will need at least these packages: libglade2-0, python, python-gtk2, python-glade2
 
 Windows users will need at least the following software packages:
 Python       http://www.python.org/download/
@@ -113,7 +134,7 @@ Also, you should run helptags:
 ------------------------------------------------------------------------------
 4.1 Explanation of the controls                   *ColorSchemeEditor-controls*
 
-4.1.1 Treeview                                    *ColorSchemeEditor-treeview*
+4.1.1 Highlight Groups TreeView                   *ColorSchemeEditor-treeview*
 The TreeView displays all highlight groups defined at the time the editor was
 launched.  Linked groups are the child nodes.  In a future version
 parent/child relationships will be modifiable by dragging a group and dropping
@@ -129,6 +150,22 @@ group a linked highlight group inherits from.  Click 'Expand All' before
 searching for a child group.
 
 Click the column headings to sort the list. 
+
+The readability column bears some explanation.  The foreground and background
+colors assigned to a particular highlight group are evaluated for their mutual
+readability.  The result of this calculation is indicated in this column by
+a colored cell.
+
+There are three algorithms that may be used.  The active algorithm is selected
+from the Readability menu.  These algorithms look at the guifg and guibg
+attributes of each highlight group.  If one or both of these are not defined,
+the algorithm will look to the guifg and guibg attributes on the Normal group
+as that is what is displayed by Gvim.  
+
+For more details, see the W3C webpages describing the algorithms:
+    http://www.w3.org/TR/AERT#color-contrast
+    http://www.w3.org/TR/WCAG20-GENERAL/G17.html    7:1 contrast ratio
+    http://www.w3.org/TR/WCAG20-GENERAL/G18.html    5:1 contrast ratio
 
 4.1.2 ColorSelection                        *ColorSchemeEditor-colorselection*
 The top one changes the foreground color of a highlight group, the bottom one
@@ -151,10 +188,14 @@ a "disconnected" state.
 If you make a change in Vim, the GUI editor won't know about it unless you do
 a refresh.  This will blow away your Undo/Redo history.
 
-4.1.5 Background radio buttons                  *ColorSchemeEditor-background*
+4.1.5 :set background menu item                 *ColorSchemeEditor-background*
 If you're going to tinker with this control, do it before you change anything
 else in the colorscheme.  It's helpful when you're starting from scratch, and
 all you know is that you want a colorscheme with a black background.
+
+4.1.6 rgb.txt TreeView                             *ColorSchemeEditor-rgb.txt*
+Displays the contents of your server's rgb.txt file.  Someday I'd like this to
+support a drag-and-drop interface to the ColorSelection controls.
 
 ------------------------------------------------------------------------------
 4.2 Commands                                      *ColorSchemeEditor-commands*

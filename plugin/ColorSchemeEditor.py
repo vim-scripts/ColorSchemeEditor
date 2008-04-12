@@ -1,10 +1,12 @@
-#!/usr/bin/python
+#!/usr/bin/python.
 # ColorSchemeEditor.vim: Provides a GUI to facilitate creating/editing a Vim colorscheme
 # Maintainer:       Erik Falor <ewfalor@gmail.com>
-# Date:             Mar 05, 2008
-# Version:          1.0.2 beta
+# Date:             Apr 12, 2008
+# Version:          1.1
 # License:          Vim license
 
+import copy
+import gobject
 import logging
 import os
 import re
@@ -20,10 +22,7 @@ import gtk.glade
 #TODO:
 #1.     Get the ColorSelection widget to use 24 bit colors instead of 48-bit colors
 #2.     Put the communication with Vim into a thread && handle asynchronously
-#7.     Vim helpfile - clicking &Help opens the Vim help page in Vim.
-#8.     Color-code the values in the listview
-#14.    Integrate rgb.txt
-#19.    Add a tooltip to explain what the different highlight elements are in the TreeView
+#19.    Add a tooltip to each row of the TreeView to explain what the different highlight elements are
 #33.    Make adding and removing highlight groups undoable
 #35.    Setting NONE attribute checkbox does not result in an atomic undo.
 #36.    Removing highlight groups from list:
@@ -32,6 +31,12 @@ import gtk.glade
 #37.    Using the eye-dropper causes a crash in Win32; PyGTK tries to bail out, but fails to secure enough
 #       resources for the "unsaved changes" nag screen 
 #39.    If you change the Name in the metadata, should that sent to Vim?
+#40.    Make a "tabula rasa" menu item that does a :hi clear
+#44.    Devise a metric to measure the overall readability of a colorscheme.
+#47.    Changing from W3C to other readability algorithms sometimes leaves values in readability column that is
+#       impossible for that readability algorithm.
+#49.    Make setting background light or dark undoable
+#50.    Drag-and-drop colors from the rgb.txt window into color selections
 
 #def gtk.check_version(required_major, required_minor, required_micro)required_major :  the required major version number
 #required_minor :   the required minor version number
@@ -47,12 +52,17 @@ class ColorSchemeEditor:
     """This is the ColorSchemeEditor application"""
 
     def __init__(self):
-        self.version            = 'v1.0 beta'
+        self.version            = 'v1.0.3 beta'
         self.serverName         = sys.argv[1]
         self.colorSchemeFile    = ''
         self.colorSchemeName    = ''
         self.dirty              = False
         self.locked             = False
+
+        #members related to text contrast and readability
+        self.contrastFunc       = self.W3CContrast
+        self.normalFG           = ''
+        self.normalBG           = ''
         
         #regular expressions used to parse output of :highlight command
         self.re_guifg           = re.compile("guifg=(#?[\w]+)")
@@ -60,10 +70,12 @@ class ColorSchemeEditor:
         self.re_gui             = re.compile("gui=(#?[\w,]+)")
         self.re_link            = re.compile("links to ([\w]+)")
         self.re_clear           = re.compile("cleared")
+        self.re_fg              = re.compile('fg|foreground|NONE')
+        self.re_bg              = re.compile('bg|background|NONE')
 
         #Set the Glade file
-        self.wTree = gtk.glade.XML(gladefile, "toplevel") 
-        self.toplevel = self.wTree.get_widget("toplevel")
+        self.wTree              = gtk.glade.XML(gladefile, "toplevel") 
+        self.toplevel           = self.wTree.get_widget("toplevel")
         self.toplevel.connect("delete_event", self.OnDeleteEvent)
 
         #Create our dictionary of handlers and connect
@@ -85,6 +97,8 @@ class ColorSchemeEditor:
                 "on_btExpand_clicked" : self.OnExpand,
                 "on_btCollapse_clicked" : self.OnCollapse,
                 "on_help1_activate" : self.OnHelp,
+                "on_rbW3C_toggled" : self.OnChangeContrastFunction,
+                "on_tbRgbTxt_clicked" : self.OnRgbTxt,
                 }
         self.wTree.signal_autoconnect(dic)
 
@@ -123,13 +137,19 @@ class ColorSchemeEditor:
         #get handles on background lignt/dark radiobuttons
         self.rbLight            =  self.wTree.get_widget('rbLight') 
         self.rbDark             =  self.wTree.get_widget('rbDark') 
+        self.menuRbLight        =  self.wTree.get_widget('menu_rbLight')
+        self.menuRbDark         =  self.wTree.get_widget('menu_rbDark')
         if self.GetBackground() == 'dark':
             self.rbDark.set_active(True)
+            self.menuRbDark.set_active(True)
         else:
             self.rbLight.set_active(True)
+            self.menuRbLight.set_active(True)
         #connect "toggled" event
         self.rbDark.handlerID   = self.rbDark.connect("toggled", self.OnRbBgToggled)
         self.rbLight.handlerID  = self.rbLight.connect("toggled", self.OnRbBgToggled)
+        self.menuRbLight.handlerID = self.menuRbLight.connect("toggled", self.OnRbBgToggled)
+        self.menuRbDark.handlerID = self.menuRbDark.connect("toggled", self.OnRbBgToggled)
 
         #handle undo/redo buttons
         self.undoStack = UndoStackButton(self.wTree.get_widget("tbUndo"))
@@ -152,10 +172,17 @@ class ColorSchemeEditor:
         self.colFG              = 1
         self.colBG              = 2
         self.colAttr            = 3
+        self.colContr           = 4
+        self.colReadability     = 5
+        self.colReadColorSet    = 6
         self.sElement           = "Element"
         self.sFG                = "Foreground"
         self.sBG                = "Background"
         self.sAttr              = "Attributes"
+        self.sContr             = "Readability"
+
+        #set minimum width for column
+        self.minColumnWidth     = 100
 
         #get the Vim highlights treeview
         self.tvVimHighlights    = self.wTree.get_widget("tvVimHighlights")
@@ -170,15 +197,22 @@ class ColorSchemeEditor:
         self.tvVimHighlights.set_expander_column(colm)
 
         #second, the Foreground column
-        colm = gtk.TreeViewColumn(self.sFG, gtk.CellRendererText(), text=self.colFG)
+        #colm = gtk.TreeViewColumn(self.sFG, gtk.CellRendererText(), text=self.colFG)
+        colorSwatchCell = CellRendererColorSwatch()
+        colm = gtk.TreeViewColumn(self.sFG, colorSwatchCell, text=self.colFG)
         colm.set_resizable(True)
+        colm.set_min_width(self.minColumnWidth)
         colm.set_sort_column_id(self.colFG)
+        colm.set_cell_data_func(colorSwatchCell, colorSwatchCell.fg_data_func, self)
         self.tvVimHighlights.append_column(colm)
         
         #third, the Background column
-        colm = gtk.TreeViewColumn(self.sBG, gtk.CellRendererText(), text=self.colBG)
+        colorSwatchCell = CellRendererColorSwatch()
+        colm = gtk.TreeViewColumn(self.sBG, colorSwatchCell, text=self.colBG)
         colm.set_resizable(True)
+        colm.set_min_width(self.minColumnWidth)
         colm.set_sort_column_id(self.colBG)
+        colm.set_cell_data_func(colorSwatchCell, colorSwatchCell.bg_data_func, self)
         self.tvVimHighlights.append_column(colm)
 
         #fourth, the Attributes column
@@ -187,13 +221,20 @@ class ColorSchemeEditor:
         colm.set_sort_column_id(self.colAttr)
         self.tvVimHighlights.append_column(colm)
 
+        #fifth, the Contrast column
+        colm = gtk.TreeViewColumn(self.sContr, gtk.CellRendererText(), text=self.colContr, background=self.colReadability, background_set=self.colReadColorSet)
+        #colm = gtk.TreeViewColumn(self.sContr, gtk.CellRendererContrast(), text=self.colContr)
+        colm.set_resizable(True)
+        colm.set_min_width(80)
+        colm.set_sort_column_id(self.colReadability)
+        self.tvVimHighlights.append_column(colm)
+
         #Create a TreeStore model to use with our treeview
-        self.vimTreeStoreDict   = TreeStoreDict(str, str, str, str)
+        self.vimTreeStoreDict   = TreeStoreDict(str, str, str, str, str, str, bool)
         #attach model to treeview
         self.tvVimHighlights.set_model(self.vimTreeStoreDict)
         #set the selection mode
         self.tvVimHighlights.get_selection().set_mode(gtk.SELECTION_BROWSE)
-        #self.InsertEditorGroups()
 
         #determine Debug level:
         if not self.GetDebugLevel():
@@ -222,39 +263,58 @@ class ColorSchemeEditor:
             self.lockControls()
             self.GetMetadata()
             self.unlockControls()
-        except VimRemoteException, vre:
+
+            self.rgbTxtPath = ''
+            #find path of rgb.txt
+            for line in self.VimRemoteExec('CSE_FindRgbTxt()'):
+                if not line.isspace(): 
+                    self.rgbTxtPath = line.strip()
+            if self.rgbTxtPath == '' or not os.access(self.rgbTxtPath, os.R_OK):
+                self.wTree.get_widget("tbRgbTxt").set_sensitive(False)
+
+        except VimRemoteException:
             self.Disconnect()
 
     def PopulateHighlightTree(self):
+        logging.debug("Entering PopulateHighlightTree()")
         self.InsertEditorGroups()
         hl = {}
         firsttime = True
         #TODO: add exception handling
         for line in self.VimRemoteExec("CSE_GetAllHighlights()"):
+
             if line.isspace():
                 continue
 
             if not line.startswith(' ') and not firsttime and (hl.has_key('hlName') or line.startswith('END')):
                 if hl.has_key('cleared'):
+                    #SYNTAX ITEMS LINKED WITH 'CLEARED' GROUP
                     parentName = 'cleared'
                     self.vimTreeStoreDict.append('cleared',
-                        [hl['hlName'], '', '', ''])
+                        [hl['hlName'], '', '', '', '', 'white', False])
                 elif hl.has_key('link'):
+                    #LINKS
                     parentName = hl['link']
                     self.vimTreeStoreDict.append(parentName,
-                        [hl['hlName'], '', '', ''])
-                    #TODO: fix this up - when would hl NOT have key 'hlName'?
-                    #should I just say 'and hl.get('hlName', '') not in self.vimTreeStoreDict?
+                        [hl['hlName'], '', '', '', '', 'white', False])
+                #TODO: fix this up - when would hl NOT have key 'hlName'?
+                #should I just say 'and hl.get('hlName', '') not in self.vimTreeStoreDict?
                 elif hl.has_key('hlName') and hl['hlName'] not in self.vimTreeStoreDict:
                     self.vimTreeStoreDict.append(None, [hl.get('hlName', ''),
                         hl.get('fgcolor', ''),
                         hl.get('bgcolor', ''),
-                        hl.get('guiattr', '')])
+                        hl.get('guiattr', ''),
+                        'DEBUG274',
+                        'white',
+                        False])
                 else:
                     self.vimTreeStoreDict.set(hl.get('hlName', ''), self.colElement, hl.get('hlName', ''),
                         self.colFG, hl.get('fgcolor', ''),
                         self.colBG, hl.get('bgcolor', ''),
-                        self.colAttr, hl.get('guiattr', ''))
+                        self.colAttr, hl.get('guiattr', ''),
+                        self.colContr, 'DEBUG280', 
+                        self.colReadability, 'white',
+                        self.colReadColorSet, False)
 
                 hl = {}
 
@@ -280,9 +340,174 @@ class ColorSchemeEditor:
                     hl['link'] = link.group(1)
                 if clear != None:
                     hl['cleared'] = True
-
             firsttime = False
+        self.EvalAllReadability()
         self.tvVimHighlights.collapse_all()
+        logging.debug("Leaving PopulateHighlightTree()")
+
+    def GetNormalColors(self):
+        """caches current fg/bg for Normal highlight group"""
+        self.normalBG = self.vimTreeStoreDict.get_value(self.vimTreeStoreDict['Normal'], self.colBG)
+        if self.normalBG == '':
+            self.normalBG  = '#FFFFFF'
+        self.normalFG = self.vimTreeStoreDict.get_value(self.vimTreeStoreDict['Normal'], self.colFG)
+        if self.normalFG == '':
+            self.normalFG  = '#000000'
+
+    def EvalAllReadability(self):
+        """Goes through all entries in TreeView and computes & displays readability score"""
+        #get the fg/bg for the normal group & store it in this instance
+        self.GetNormalColors()
+        nodes = []
+        node = self.vimTreeStoreDict.get_iter_root()
+        while node != None:
+            nodes .append(node)
+            node = self.vimTreeStoreDict.iter_next(node)
+
+        for node in nodes:
+            name = self.vimTreeStoreDict.get_value(node, self.colElement)
+            if name != 'cleared':
+                fg = self.vimTreeStoreDict.get_value(node, self.colFG)
+                bg = self.vimTreeStoreDict.get_value(node, self.colBG)
+                try:
+                    score, rating, colorize = self.contrastFunc(fg, bg)
+                    #self.vimTreeStoreDict.set_value(name, self.colContr, score)
+                    self.vimTreeStoreDict.set(name, self.colContr, score, self.colReadability, rating, self.colReadColorSet, colorize)
+                except TypeError:
+                    print "TypeError: name=%s, fg=%s, bg=%s" % (name, fg, bg) 
+
+    def GetApparantColors(self, foreground, background):
+        """resolves the visible fg/bg colors of a highlight group by returning defined colors, 
+            or the default colors from the Normal group.
+            relies upon the presence of the self.normal[FB]G members
+            returns two dicts: fg and bg with keys for each component: red, green and blue """
+        logging.info("GetApparantColors() foreground = '%s'\tbackground = '%s'" % ( foreground, background) )
+
+        if len(foreground) == 0 or self.re_fg.match(foreground):
+            #the foreground color of this group is using the fg of the Normal group
+            if self.normalFG == '':
+                self.GetNormalColors()
+            foreground = self.normalFG
+        elif self.re_bg.match(foreground):
+            #the foreground color of this group is using the bg of the Normal group
+            if self.normalBG == '':
+                self.GetNormalColors()
+            foreground = self.normalBG
+
+        if len(background) == 0 or self.re_bg.match(background):
+            #the background color of this group is using the bg of the Normal group
+            if self.normalBG == '':
+                self.GetNormalColors()
+            background = self.normalBG
+        elif self.re_fg.match(background):
+            #the background color of this group is using the fg of the Normal group
+            if self.normalFG == '':
+                self.GetNormalColors()
+            background = self.normalFG
+
+        try:
+            fg = self.ColorToHexes(gtk.gdk.color_parse(foreground))
+        except ValueError:
+            raise ValueError("Can't parse %s" % foreground)
+        try:
+            bg = self.ColorToHexes(gtk.gdk.color_parse(background))
+        except ValueError:
+            raise ValueError("Can't parse %s" % background)
+        return fg, bg
+
+    def W3CContrast(self, foreground, background):
+        """Computes the contrast between foreground and background elements 
+            returns the scores for brightness and color difference.
+            If the scores are greater than a set range, then the colors make a good match.
+            http://www.w3.org/TR/AERT#color-contrast"""
+
+        try:
+            fg, bg = self.GetApparantColors(foreground, background)
+        except ValueError, ve:
+            return '', ContrastRating.NONE, False
+
+        #calculate brightness
+        brightBG = ((bg['red'] * 229) + ( bg['green'] * 587) + (bg['blue'] * 114)) / 1000.0
+        brightFG = ((fg['red'] * 229) + ( fg['green'] * 587) + (fg['blue'] * 114)) / 1000.0
+        brightness = abs(brightBG - brightFG)
+
+        #calculate color difference
+        difference = abs(bg['red'] - fg['red']) + abs(bg['green'] - fg['green']) + abs(bg['blue'] - fg['blue'])
+
+        #return '%s on %s %s/125 %s/500' % (foreground, background, brightness, difference)
+        #return a string indicating how readable these combinations are
+        if brightness >= 125 and difference >= 500:
+            #return "B%.1f/D%.1f" % (brightness, difference), ContrastRating.GOOD, True
+            return ":-)", ContrastRating.GOOD, True
+        elif brightness < 125 and difference < 500:
+            #return "B%.1f/D%.1f" % (brightness, difference), ContrastRating.BAD, True
+            return ":'(", ContrastRating.BAD, True
+        elif brightness < 125:
+            #return "B%.1f/D%.1f" % (brightness, difference), ContrastRating.SOSO, True
+            return "too dim", ContrastRating.SOSO, True
+        else:
+            #return "B%.1f/D%.1f" % (brightness, difference), ContrastRating.SOSO, True
+            return "too similar", ContrastRating.SOSO, True
+
+    def SevenToOneContrast(self, foreground, background):
+        """Computes the contrast between foreground and background elements 
+            Evaluates for a 7:1 ratio between foreground and background
+            http://www.w3.org/TR/WCAG20-GENERAL/G17.html """
+        try:
+            fg, bg = self.GetApparantColors(foreground, background)
+        except ValueError, ve:
+            return '', ContrastRating.NONE, False
+
+        for dict in [fg, bg]:
+            for color in ['red', 'green', 'blue']:
+                srgb = dict[color] / 255.0
+                if srgb <= 0.03928:
+                    dict['BIG' + color] = srgb / 12.92
+                else:
+                    dict['BIG' + color] = ((srgb + 0.055) / 1.055) ** 2.4
+            dict['luminance'] = 0.2126 * dict['BIGred'] + 0.7152 * dict['BIGgreen'] + 0.722 * dict['BIGblue']
+
+        if bg['luminance'] > fg['luminance']:
+            logging.info("SevenToOneContrast() in: fg=#%.2x%.2x%.2x bg=#%.2x%.2x%.2x\n\tout: %f/%f" % (fg['red'], fg['green'], fg['blue'], bg['red'], bg['green'], bg['blue'], bg['luminance'], fg['luminance']))
+            contrast = (bg['luminance'] + .05) / (fg['luminance'] + .05)
+        else:
+            logging.info("SevenToOneContrast() in: fg=#%.2x%.2x%.2x bg=#%.2x%.2x%.2x\n\tout: %f/%f" % (fg['red'], fg['green'], fg['blue'], bg['red'], bg['green'], bg['blue'], fg['luminance'], bg['luminance']))
+            contrast = (fg['luminance'] + .05) / (bg['luminance'] + .05)
+
+        if contrast >= 7:
+            return "%.1f:1" % contrast, ContrastRating.GOOD, True
+        else:
+            return "%.1f:1" % contrast, ContrastRating.BAD, True
+
+    def FiveToOneContrast(self, foreground, background):
+        """Computes the contrast between foreground and background elements 
+            Evaluates for a 5:1 ratio between foreground and background
+            http://www.w3.org/TR/WCAG20-GENERAL/G18.html """
+        try:
+            fg, bg = self.GetApparantColors(foreground, background)
+        except ValueError, ve:
+            return '', ContrastRating.NONE, False
+
+        for dict in [fg, bg]:
+            for color in ['red', 'green', 'blue']:
+                srgb = dict[color] / 255.0
+                if srgb <= 0.03928:
+                    dict['BIG' + color] = srgb / 12.92
+                else:
+                    dict['BIG' + color] = ((srgb + 0.055) / 1.055) ** 2.4
+            dict['luminance'] = 0.2126 * dict['BIGred'] + 0.7152 * dict['BIGgreen'] + 0.722 * dict['BIGblue']
+
+        if bg['luminance'] > fg['luminance']:
+            logging.info("FiveToOneContrast() in: fg=#%.2x%.2x%.2x bg=#%.2x%.2x%.2x\n\tout: %f/%f" % (fg['red'], fg['green'], fg['blue'], bg['red'], bg['green'], bg['blue'], bg['luminance'], fg['luminance']))
+            contrast = (bg['luminance'] + .05) / (fg['luminance'] + .05)
+        else:
+            logging.info("FiveToOneContrast() in: fg=#%.2x%.2x%.2x bg=#%.2x%.2x%.2x\n\tout: %f/%f" % (fg['red'], fg['green'], fg['blue'], bg['red'], bg['green'], bg['blue'], fg['luminance'], bg['luminance']))
+            contrast = (fg['luminance'] + .05) / (bg['luminance'] + .05)
+
+        if contrast >= 5:
+            return "%.1f:1" % contrast, ContrastRating.GOOD, True
+        else:
+            return "%.1f:1" % contrast, ContrastRating.BAD, True
 
     def VimRemoteExec(self, command):
         """runs a command against the vim server"""
@@ -343,6 +568,10 @@ class ColorSchemeEditor:
         #print  "!!!ColorToString() AFTER : #%.2X%.2X%.2X" % (gdkColor.red / 256, gdkColor.green / 256, gdkColor.blue / 256)
         return  "#%.2X%.2X%.2X" % (gdkColor.red / 256, gdkColor.green / 256, gdkColor.blue / 256)
         
+    def ColorToHexes(self, gdkColor):
+        """renders a gdkColor into three 8-bit values, returned as a dict"""
+        return { 'red' : gdkColor.red / 256, 'green' : gdkColor.green / 256, 'blue' : gdkColor.blue / 256}
+
     def WriteColorScheme(self):
         """writes the contents of the listview out to a file"""
         if self.colorSchemeFile == '':
@@ -719,6 +948,7 @@ class ColorSchemeEditor:
             self.dirty = True
 
     def InsertEditorGroups(self):
+        logging.debug("Entering InsertEditorGroups()")
         for i in [ 'Cursor', 'CursorIM', 'CursorColumn', 'CursorLine',
                 'DiffAdd', 'DiffChange', 'DiffDelete', 'DiffText', 'Directory',
                 'ErrorMsg', 'FoldColumn', 'Folded', 'IncSearch', 'LineNr',
@@ -736,7 +966,8 @@ class ColorSchemeEditor:
                 'Statement', 'StorageClass', 'String', 'Structure', 'Tag',
                 'Todo', 'Type', 'Typedef', 'Underlined' ]:
             logging.error("\tinserting editor group %s" % i)
-            self.vimTreeStoreDict.append(None, (i, '', '', ''))
+            self.vimTreeStoreDict.append(None, (i, '', '', '', '', 'white', False))
+        logging.debug("Leaving InsertEditorGroups()")
 
     def lockControls(self):
         logging.debug( "LOCKING controls " )
@@ -744,7 +975,7 @@ class ColorSchemeEditor:
                 self.cbStandout, self.cbNone, self.csForeground, self.csBackground, 
                 self.entColorSchemeName, self.entMaintainer, self.entEmail,
                self.entVersion, self.entURL, self.texLicense, self.texNotes,
-                self.rbLight, self.rbDark]:
+                self.rbLight, self.rbDark, self.menuRbLight, self.menuRbDark]:
             w.handler_block( w.handlerID )
         for w in self.colorButtons:
             w.handler_block( w.handlerID )
@@ -757,7 +988,7 @@ class ColorSchemeEditor:
                 self.cbStandout, self.cbNone, self.csForeground, self.csBackground, 
                 self.entColorSchemeName, self.entMaintainer, self.entEmail,
                self.entVersion, self.entURL, self.texLicense, self.texNotes,
-                self.rbLight, self.rbDark]:
+                self.rbLight, self.rbDark, self.menuRbLight, self.menuRbDark]:
             w.handler_unblock( w.handlerID )
         for w in self.colorButtons:
             w.handler_unblock( w.handlerID )
@@ -768,10 +999,26 @@ class ColorSchemeEditor:
     # EVENT HANDLER CALLBACKS #
     ###########################
 
+    def OnChangeContrastFunction(self, widget):
+        if widget.get_active():
+            if widget.name == 'rbW3C':
+                self.contrastFunc = self.W3CContrast
+            elif widget.name == 'rb71':
+                self.contrastFunc = self.SevenToOneContrast
+            elif widget.name == 'rb51':
+                self.contrastFunc = self.FiveToOneContrast
+            self.EvalAllReadability()
+
+    def OnRgbTxt(self, widget):
+        if self.rgbTxtPath == '' or not os.access(self.rgbTxtPath, os.R_OK):
+            self.wTree.get_widget("tbRgbTxt").set_sensitive(False)
+        else:
+            RgbTxtWindow(self.rgbTxtPath)
+
     def OnRbBgToggled(self, widget):
         """Send the value of the active radiobutton to Vim"""
         if widget.get_active():
-            if widget.name == 'rbLight':
+            if widget.name == 'rbLight' or widget.name == 'menu_rbLight':
                 cmd = "CSE_SetBackground('light')"
             else:
                 cmd = "CSE_SetBackground('dark')"
@@ -787,6 +1034,7 @@ class ColorSchemeEditor:
             self.dirty = True
 
     def OnBtColorClicked(self, widget):
+        """Callback for Foreground, Background and NONE buttons for both forground and background"""
         (model, iter) = self.tvVimHighlights.get_selection().get_selected()
         if iter == None:
             return
@@ -794,32 +1042,43 @@ class ColorSchemeEditor:
         update = None
         hlName = self.vimTreeStoreDict.get_value(iter, self.colElement)
         if 'btBgNone' == widget.name:
-            self.vimTreeStoreDict.set_value(iter, self.colBG, 'NONE')
+            column, newVal = self.colBG, 'NONE'
             cmd = "CSE_SetHighlight('" + hlName + "', 'guibg=NONE')"
         elif 'btFgNone' == widget.name:
-            self.vimTreeStoreDict.set_value(iter, self.colFG, 'NONE')
+            column, newVal = self.colFG, 'NONE'
             cmd =  "CSE_SetHighlight('" + hlName + "', 'guifg=NONE')"
         elif 'btFgFg' == widget.name and hlName != 'Normal':
             update = (self.csForeground, 1)
-            self.vimTreeStoreDict.set_value(iter, self.colFG, 'fg')
+            column, newVal = self.colFG, 'fg'
             cmd =  "CSE_SetHighlight('" + hlName + "', 'guifg=fg')"
         elif 'btFgBg' == widget.name and hlName != 'Normal':
             update = (self.csForeground, 2)
-            self.vimTreeStoreDict.set_value(iter, self.colFG, 'bg')
+            column, newVal = self.colFG, 'bg'
             cmd =  "CSE_SetHighlight('" + hlName + "', 'guifg=bg')"
         elif 'btBgFg' == widget.name and hlName != 'Normal':
             update = (self.csBackground, 1)
-            self.vimTreeStoreDict.set_value(iter, self.colBG, 'fg')
+            column, newVal = self.colBG, 'fg'
             cmd =  "CSE_SetHighlight('" + hlName + "', 'guibg=fg')"
         elif 'btBgBg' == widget.name and hlName != 'Normal':
             update = (self.csBackground, 2)
-            self.vimTreeStoreDict.set_value(iter, self.colBG, 'bg')
+            column, newVal = self.colBG, 'bg'
             cmd =  "CSE_SetHighlight('" + hlName + "', 'guibg=bg')"
         else:
-            cmd = ''
+            cmd, column, newVal = '', None, None
 
+        #send the change to Vim
         if '' != cmd:
             self.PushChange(hlName, cmd, iter)
+
+        #update the TreeStore:
+        if column != None and newVal != None and hlName != 'cleared':
+            self.vimTreeStoreDict.set_value(hlName, column, newVal)
+            iter = self.vimTreeStoreDict.get(hlName, None)
+            if iter != None:
+                score, rating, colorize = self.contrastFunc(self.vimTreeStoreDict.get_value(iter, self.colFG),
+                        self.vimTreeStoreDict.get_value(iter, self.colBG))
+                logging.debug("OnBtColorClicked() %s = %s" % (hlName, score))
+                self.vimTreeStoreDict.set(hlName, self.colContr, score, self.colReadability, rating, self.colReadColorSet, colorize)
 
         #update the color selector
         if None == update:
@@ -827,13 +1086,13 @@ class ColorSchemeEditor:
         try:
             color = gtk.gdk.color_parse(
                     (self.ParseVimHighlight( self.VimRemoteExec( "CSE_GetHighlight('Normal')" ) ))[update[1]])
-            logging.debug("gonna set %s to color %s" % update)
+            logging.debug("gonna set %s to color %s" % (update[0], color))
             self.lockControls()
             update[0].set_current_color(color)
             self.unlockControls()
-        except VimRemoteException, vre:
+        except VimRemoteException:
                 self.Disconnect()
-        except ValueError, ve:
+        except ValueError:
             pass
 
     def OnHighlightRowActivated(self, treeview, path, view_column):
@@ -850,12 +1109,19 @@ class ColorSchemeEditor:
             self.lockControls()
             #set the current color for the ColorSelection widgets
             #print "FG is %s, BG is %s" % (fgStr, bgStr)
-            if fgStr != '' and fgStr != 'bg' and fgStr != 'fg':
-                foreground = gtk.gdk.color_parse(fgStr)
-                self.csForeground.set_current_color(foreground)
-            if bgStr != '' and bgStr != 'bg' and bgStr != 'fg':
-                background = gtk.gdk.color_parse(bgStr)
-                self.csBackground.set_current_color(background)
+            try:
+                if fgStr != '' and fgStr != 'bg' and fgStr != 'fg':
+                    foreground = gtk.gdk.color_parse(fgStr)
+                    self.csForeground.set_current_color(foreground)
+            except ValueError:
+                pass
+
+            try:
+                if bgStr != '' and bgStr != 'bg' and bgStr != 'fg':
+                    background = gtk.gdk.color_parse(bgStr)
+                    self.csBackground.set_current_color(background)
+            except ValueError:
+                pass
 
             #set checkboxes
             self.SetCheckboxes(attrs)
@@ -888,28 +1154,39 @@ class ColorSchemeEditor:
             if iter == None:
                 return
 
-            hlName = self.vimTreeStoreDict.get_value(iter, self.colElement)
             cmd = ''
+            hlName = self.vimTreeStoreDict.get_value(iter, self.colElement)
+
+            colr = cs.get_current_color()
+            colrs = self.ColorToString(colr)
+
+            logging.debug( "r=%.4x g=%.4x b=%.4x" % (colr.red, colr.green, colr.blue) )
+            colr24 = self.colormap.alloc_color(colr.red, colr.green, colr.blue, writeable=False, best_match=True)
+            colr24s = self.ColorToString(colr24)
+
+            logging.debug( "colrs='%s' colr24s='%s' colr24.pixel='%X'" % (colrs, colr24s, colr24.pixel) )
+            if colrs != colr24s:
+                logging.warning( "the two colors' string representations differ!!")
 
             if cs.get_name().startswith('csFore'):
-                colr = cs.get_current_color()
-                colrs = self.ColorToString(colr)
-
-                logging.debug( "r=%.4x g=%.4x b=%.4x" % (colr.red, colr.green, colr.blue) )
-                colr24 = self.colormap.alloc_color(colr.red, colr.green, colr.blue, writeable=False, best_match=True)
-                colr24s = self.ColorToString(colr24)
-
-                logging.debug( "colrs='%s' colr24s='%s' colr24.pixel='%X'" % (colrs, colr24s, colr24.pixel) )
-                if colrs != colr24s:
-                    logging.warning( "the two colors' string representations differ!!")
-
-                self.vimTreeStoreDict.set_value(iter, self.colFG, colr24s)
+                self.vimTreeStoreDict.set_value(hlName, self.colFG, colr24s)
                 cmd = "CSE_SetHighlight('%s', 'guifg=%s')" % (hlName, colr24s)
             else:
-                colr = self.ColorToString(cs.get_current_color())
-                logging.debug( "background color name is %s" % colr)
-                self.vimTreeStoreDict.set_value(iter, self.colBG, self.ColorToString(cs.get_current_color()))
-                cmd = "CSE_SetHighlight('%s', 'guibg=%s')" % (hlName, colr)
+                self.vimTreeStoreDict.set_value(hlName, self.colBG, colr24s)
+                cmd = "CSE_SetHighlight('%s', 'guibg=%s')" % (hlName, colr24s)
+
+            #update the readability column:
+            if hlName == 'Normal':
+                self.EvalAllReadability()
+            else:
+                iter = self.vimTreeStoreDict.get(hlName, None)
+                if iter != None:
+                    score, rating, colorize = self.contrastFunc(self.vimTreeStoreDict.get_value(iter, self.colFG),
+                            self.vimTreeStoreDict.get_value(iter, self.colBG))
+                    logging.debug("OnColorChange() %s = %s" % (hlName, score))
+                    #self.vimTreeStoreDict.set_value(hlName, self.colContr, score)
+                    self.vimTreeStoreDict.set(hlName, self.colContr, score, self.colReadability, rating, self.colReadColorSet, colorize)
+
             self.PushChange(hlName, cmd, iter)
 
     def OnSave(self, widget):
@@ -931,7 +1208,7 @@ class ColorSchemeEditor:
                 if l.isspace():
                     continue
                 dirs.append(l.strip())
-        except VimRemoteException, vre:
+        except VimRemoteException:
             pass
 
         #select the file name
@@ -1002,6 +1279,7 @@ class ColorSchemeEditor:
         if None == iter:
             logging.debug( "***EXIT EARLY OnCheckboxToggle(%s)" % widget.name )
             return
+        hlName = self.vimTreeStoreDict.get_value(iter, self.colElement)
         attrStr = ''
         if 'cbNone' == widget.name:
             #if NONE is selected, remove all other attributes
@@ -1009,7 +1287,7 @@ class ColorSchemeEditor:
                 self.ResetCheckboxes()
                 widget.set_active(True)
                 attrStr = 'NONE'
-                self.vimTreeStoreDict.set_value(iter, self.colAttr, attrStr)
+                self.vimTreeStoreDict.set_value(hlName, self.colAttr, attrStr)
         else:
             logging.debug( "\t===CHECK cbNone===" )
             self.cbNone.set_active(False) #reset NONE checkbox
@@ -1029,7 +1307,7 @@ class ColorSchemeEditor:
             attrStr = ','.join(attrs).lstrip(',')
             if attrStr == '':
                 attrStr = 'NONE'
-            self.vimTreeStoreDict.set_value(iter, self.colAttr, attrStr)
+            self.vimTreeStoreDict.set_value(hlName, self.colAttr, attrStr)
             #send the changes to vim
             hlName = self.vimTreeStoreDict.get_value(iter, self.colElement)
             cmd = "CSE_SetHighlight('%s', 'gui=%s')" % (hlName, attrStr)
@@ -1049,7 +1327,7 @@ class ColorSchemeEditor:
             else:
                 self.rbLight.set_active(True)
             self.sbColorsname.push(self.sbColorsnameCtx, "Editing color scheme '%s'" % self.colorSchemeName)
-        except VimRemoteException, vre:
+        except VimRemoteException:
             self.Disconnect(), 
         logging.debug( "Left OnRefresh()" )
 
@@ -1082,7 +1360,7 @@ class ColorSchemeEditor:
         #put the current state onto the redo stack
         try:
             lines = self.VimRemoteExec( "CSE_GetHighlight('" + hlName + "')" )
-        except VimRemoteException, vre:
+        except VimRemoteException:
             self.Disconnect()
         redohlName, redofgcolor, redobgcolor, redoguiattr = self.ParseVimHighlight(lines)
         redoArg = "guifg=%s guibg=%s gui=%s" % (redofgcolor, redobgcolor, redoguiattr)
@@ -1101,7 +1379,19 @@ class ColorSchemeEditor:
                     self.colFG, fgcolor,
                     self.colBG, bgcolor,
                     self.colAttr, guiattr)
-        except VimRemoteException, vre:
+
+            #update the readability column
+            if hlName == 'Normal':
+                self.EvalAllReadability()
+            else:
+                iter = self.vimTreeStoreDict.get(hlName, None)
+                if iter != None:
+                    score, rating, colorize = self.contrastFunc(self.vimTreeStoreDict.get_value(iter, self.colFG),
+                            self.vimTreeStoreDict.get_value(iter, self.colBG))
+                    logging.debug("OnUndo() %s = %s" % (hlName, score))
+                    #self.vimTreeStoreDict.set_value(hlName, self.colContr, score)
+                    self.vimTreeStoreDict.set(hlName, self.colContr, score, self.colReadability, rating, self.colReadColorSet, colorize)
+        except VimRemoteException:
             self.Disconnect()
 
         #if the item we just undid is the currently selected item, we should
@@ -1113,10 +1403,12 @@ class ColorSchemeEditor:
             self.lockControls()
             try:
                 self.csForeground.set_current_color(gtk.gdk.color_parse(fgcolor))
-            except ValueError, ve: pass
+            except ValueError:
+                pass
             try:
                 self.csBackground.set_current_color(gtk.gdk.color_parse(bgcolor))
-            except ValueError, ve: pass
+            except ValueError:
+                pass
             self.SetCheckboxes(guiattr.split(','))
             self.unlockControls()
             redo.unlock()
@@ -1134,7 +1426,7 @@ class ColorSchemeEditor:
     def OnHelp(self, w):
         try:
             self.VimRemoteExec('CSE_ShowHelp()')
-        except VimRemoteException, vre:
+        except VimRemoteException:
             self.Disconnect()
 
     def OnConnect(self, widget):
@@ -1170,7 +1462,7 @@ class ColorSchemeEditor:
                 self.serverName = server
                 self.VimRemoteExec("string('Hello World')")
 
-            except VimRemoteException, vre:
+            except VimRemoteException:
                 #display an error message
                 self.serverName = oldServerName
                 self.sbConnection.push(self.sbConnectionCtx, "Vim instance %s unavailable" % server)
@@ -1225,7 +1517,7 @@ class ColorSchemeEditor:
 
         if (result == gtk.RESPONSE_OK):
             """the user clicked OK, so change the list"""
-            self.vimTreeStoreDict.append(None, (hlName, '', '', ''))
+            self.vimTreeStoreDict.append(None, (hlName, '', '', '', '', 'white', False))
 
     def OnRemove(self, w):
         """remove highlighted item from treeview"""
@@ -1348,6 +1640,28 @@ class ConnectDialog:
         server = entry.get_active_text()
         dlg.destroy()
         return result, server
+
+class RgbTxtWindow:
+    def __init__(self, file):
+        self.wTree  = gtk.glade.XML(gladefile, "winRgbTxt") 
+        self.rgbtxt = RgbTxt(file, self.wTree)
+
+    def run(self):
+        """this function will show the FileChooser dialog"""
+    
+        #load teh dialog from teh glade
+        self.wTree = gtk.glade.XML(gladefile, "winRgbTxt") 
+
+        #get the actual dialog object
+        self.dlg = self.wTree.get_widget("winRgbTxt")
+
+        #run teh dialog and store teh response
+        self.dlg.run()
+
+        #done with teh dialog, destroy
+        self.dlg.destroy()
+
+        return self.result, file
 
 class UndoStackButton:
     """Implements the undo/redo stack, and disables the button when no action can be taken"""
@@ -1475,7 +1789,9 @@ class TreeStoreDict(gtk.TreeStore):
                 gtk.TreeStore.set(self, iter, 0, value[0], 
                         1, value[1],
                         2, value[2],
-                        3, value[3])
+                        3, value[3],
+                        4, value[4],
+                        5, value[5])
 
             elif parentIter != iter:
                 #remove it from it's old position
@@ -1507,7 +1823,7 @@ class TreeStoreDict(gtk.TreeStore):
                 if not self.dict.has_key(parent):
                     #if parent isn't in the dictionary, make an entry
                     logging.debug("Getting ahead of ourselves with %s=>%s" % (value[0], parent))
-                    parentIter = gtk.TreeStore.append(self, None, (parent, '', '', ''))
+                    parentIter = gtk.TreeStore.append(self, None, (parent, '', '', '', '', 'white', False))
                     self.dict[parent] = parentIter
                 else:
                     parentIter = self.dict[parent]
@@ -1536,8 +1852,21 @@ class TreeStoreDict(gtk.TreeStore):
             logging.debug("again, iter = %s" % str(iter))
             gtk.TreeStore.set(self, iter, *values)
         else:
-            logging.debug("what?  I thought that iter = %s" % str(iter))
+            logging.debug("1597:what?  iter should == False.  Actually: '%s'" % str(iter))
 
+    def set_value(self, name, *values):
+        """wraps TreeStore's set_value() method,
+            But uses the highlight element's name as the key instead of an inter
+            This maintains uniqueness of highlight elements' names, but means that
+            we don't deal directly with iters, but rather with their names"""
+        logging.debug("TreeStoreDict.set_value(%s)" % name )
+        iter = self.dict.get(name, False)
+        logging.debug("iter = %s" % str(iter))
+        if iter != False:
+            logging.debug("again, iter = %s" % str(iter))
+            gtk.TreeStore.set_value(self, iter, *values)
+        else:
+            logging.debug("1608:what?  iter should == False.  Actually: '%s'" % str(iter))
 
     def __contains__(self, key):
         """ k in d """
@@ -1546,6 +1875,220 @@ class TreeStoreDict(gtk.TreeStore):
     def get(self, key, default):
         """d.get('key', 'defaultvalue')"""
         return self.dict.get(key, default)
+
+    def foreach(self, func, *user_data):
+        """wraps gtk.TreeModel.foreach()"""
+        gtk.TreeStore.foreach(self, func, *user_data)
+
+class ContrastRating:
+    """maps rating quality to colors used to set the background of readability column"""
+    NONE = 'white'
+    GOOD = 'palegreen'
+    SOSO = 'lightgoldenrod1'
+    BAD  = '#FF8670'
+
+class CellRendererColorSwatch(gtk.GenericCellRenderer):
+    """renders a swatch showing a color along with its name or hex triplet"""
+    TOGGLE_WIDTH = 6
+    SWATCH_WIDTH = 30
+    WHITE = gtk.gdk.color_parse('white')
+    BLACK = gtk.gdk.color_parse('black')
+    __gproperties__ = {
+            "text": (gobject.TYPE_OBJECT, "Text", "Text", gobject.PARAM_READWRITE),
+            }
+
+    def __init__(self):
+        self.__gobject_init__()
+        self.color = None
+        self.colorName = None
+        self.xpad = -2; self.ypad = -2
+        self.xalign = 0.0; self.yalign = 0.5
+        self.active = 0
+
+    def on_get_size(self, widget, cell_area):
+        calc_width = self.xpad * 2 + CellRendererColorSwatch.TOGGLE_WIDTH
+        calc_height = self.ypad * 2 + CellRendererColorSwatch.TOGGLE_WIDTH
+        if cell_area:
+            x_offset = self.xalign * (cell_area.width - calc_width)
+            x_offset = max(x_offset, 0)
+            y_offset = self.yalign * (cell_area.height - calc_height)
+            y_offset = max(y_offset, 0)            
+        else:
+            x_offset = 0
+            y_offset = 0
+        return calc_width, calc_height, x_offset, y_offset
+
+    def on_render(self, window, widget, background_area,
+                  cell_area, expose_area, flags):
+        """Renders the cell with a swatch of color"""
+
+        if self.colorName == '':
+            return
+
+        #backup the GC before tweaking it:
+        self.gc = widget.style.bg_gc[gtk.STATE_NORMAL]
+        myGC = gtk.gdk.GC(window)
+        myGC.copy(self.gc)
+
+        #fill in the swatch with the color
+        self.gc = widget.style.bg_gc[gtk.STATE_NORMAL]
+        self.gc.set_fill(gtk.gdk.SOLID)
+        try:
+            self.gc.set_rgb_fg_color(self.color)
+        except ValueError:
+            print "color is %s; colorName is: '%s'" % ( str(self.color), str(self.colorName))
+            self.gc.set_rgb_fg_color(CellRendererColorSwatch.WHITE)
+        window.draw_rectangle(self.gc, True, cell_area.x+1, cell_area.y+1, CellRendererColorSwatch.SWATCH_WIDTH - 1, cell_area.height-1)
+
+        #draw a border around the swatch
+            #on windows, GTK+ draws the selected row's background in grey if the TreeView doesn't have focus
+            #on linux, the selected row stays blue
+        if os.name == 'nt':
+            if flags & gtk.CELL_RENDERER_SELECTED and widget.is_focus():
+                self.gc.set_rgb_fg_color(CellRendererColorSwatch.WHITE)
+            else:
+                self.gc.set_rgb_fg_color(CellRendererColorSwatch.BLACK)
+        else:
+            if flags & gtk.CELL_RENDERER_SELECTED:
+                self.gc.set_rgb_fg_color(CellRendererColorSwatch.WHITE)
+            else:
+                self.gc.set_rgb_fg_color(CellRendererColorSwatch.BLACK)
+        window.draw_rectangle(self.gc, False, cell_area.x, cell_area.y, CellRendererColorSwatch.SWATCH_WIDTH, cell_area.height)
+
+        #put the color's name
+        self.gc = widget.style.bg_gc[gtk.STATE_NORMAL]
+        self.gc.set_fill(gtk.gdk.SOLID)
+        window.draw_layout(self.gc, cell_area.x+5 + CellRendererColorSwatch.SWATCH_WIDTH,
+                cell_area.y+3, widget.create_pango_layout(self.colorName))
+        #restore the gc before returning...
+        self.gc.copy(myGC)
+
+    def on_activate(self, event, widget, path, background_area, cell_area, flags):
+        print "on_activate'ed!!!"
+
+    def start_editing(self, event, widget, path, background_area, cell_area, flags):
+        print "start_editing'ed!!!"
+
+    def activate(self, event, widget, path, background_area, cell_area, flags):
+        print "activate'ed!!!"
+
+    def stop_editing(canceled):
+        print "stop_editing'ed!!!"
+
+    def on_start_editing(self, event, widget, path, background_area, cell_area, flags):
+        print "on_start_editing'ed!!!"
+
+    def do_set_property(self, pspec, value):
+            setattr(self, pspec.name, value)
+
+    def do_get_property(self, pspec):
+        return getattr(self, pspec.name)
+
+    def fg_data_func(self, column, cell, model, iter, user_data):
+        """curried function call; helps data_func know what is meant when 
+        referring to a color swatch in terms of Normal FG/BG"""
+        self.data_func(column, cell, model, iter, 'fg', user_data)
+
+    def bg_data_func(self, column, cell, model, iter, user_data):
+        """Curried function call"""
+        self.data_func(column, cell, model, iter, 'bg', user_data)
+
+    def data_func(self, column, cell, model, iter, color, user_data):
+        """translates a string into a GDK color"""
+        if user_data == None:
+            self.colorName = ''
+            self.color = CellRendererColorSwatch.WHITE
+            print "data_func() user_data is None"
+            return
+
+        if color == 'fg':
+            self.colorName = model.get_value(iter, user_data.colFG)
+        elif color == 'bg':
+            self.colorName = model.get_value(iter, user_data.colBG)
+
+        try:
+            if self.colorName == 'bg':
+                self.color = gtk.gdk.color_parse(user_data.normalBG)
+            elif self.colorName == 'fg':
+                self.color = gtk.gdk.color_parse(user_data.normalFG)
+            else:
+                self.color = gtk.gdk.color_parse(self.colorName)
+        except ValueError:
+            self.color = CellRendererColorSwatch.WHITE
+
+    def rgbtxt_data_func(self, column, cell, model, iter, user_data):
+        """translates a string into a GDK color"""
+        if user_data == None:
+            self.colorName = ''
+            self.color = CellRendererColorSwatch.WHITE
+            print "rgbtxt_data_func() user_data is None"
+            return
+
+        self.colorName = model.get_value(iter, user_data)
+
+        try:
+            self.color = gtk.gdk.color_parse(self.colorName)
+        except ValueError:
+            self.color = CellRendererColorSwatch.WHITE
+gobject.type_register(CellRendererColorSwatch)
+
+class RgbTxt:
+    """populates the rgb.txt treeview,
+    acts as a backup colors database for gtk.gdk.color_parse()"""
+
+    re_rgbLine           = re.compile("(\d+)\s+(\d+)\s+(\d+)\s+(.*)$")
+    colName     = 0
+    colSwatch   = 1
+    sName       = 'Name'
+    sSwatch     = 'Color'
+
+    def __init__(self, rgbTxtPath, wTree):
+        self.rgbTreeView = wTree.get_widget('tvRgbTxt')
+        self.rgbTxtPath  = rgbTxtPath
+        
+        #add the columns to the treeview
+        #first, the Name column
+        colm = gtk.TreeViewColumn(RgbTxt.sName, gtk.CellRendererText(), text=RgbTxt.colName)
+        colm.set_resizable(True)
+        colm.set_sort_column_id(RgbTxt.colName)
+        self.rgbTreeView.append_column(colm)
+        self.rgbTreeView.set_expander_column(colm)
+
+        #second, the Color column containing a color swatch
+        colorSwatchCell = CellRendererColorSwatch()
+        colm = gtk.TreeViewColumn(RgbTxt.sSwatch, colorSwatchCell, text=RgbTxt.colSwatch)
+        colm.set_resizable(True)
+        colm.set_sort_column_id(RgbTxt.colSwatch)
+        colm.set_cell_data_func(colorSwatchCell, colorSwatchCell.rgbtxt_data_func, RgbTxt.colSwatch)
+        self.rgbTreeView.append_column(colm)
+        self.rgbTreeView.set_expander_column(colm)
+
+        #Create a TreeStore model to use with our treeview
+        self.rgbTreeStore   = gtk.TreeStore(str, str)
+        #attach model to treeview
+        self.rgbTreeView.set_model(self.rgbTreeStore)
+        #set the selection mode
+        self.rgbTreeView.get_selection().set_mode(gtk.SELECTION_BROWSE)
+        #populate the tree
+        self.PopulateTreeView()
+
+    def PopulateTreeView(self):
+        """loop through lines in rgb.txt, adding colors to treeview"""
+        f = open(self.rgbTxtPath, 'r')
+        for line in f:
+            if line.isspace() or line.startswith('#') or line.startswith('!'):
+                continue
+            hex, name = self.ParseRgbLine(line)
+            if hex != None:
+                self.rgbTreeStore.append(None, [name, hex])
+
+    def ParseRgbLine(self, line):
+        """return a tuple: (name, hex value)"""
+        m = RgbTxt.re_rgbLine.search(line)
+        if m == None:
+            return (None, None)
+        hex = "#%.2X%.2X%.2X" % (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        return (hex, m.group(4))
 
 if __name__ == "__main__":
     cse = ColorSchemeEditor()

@@ -1,16 +1,24 @@
 " ColorSchemeEditor.vim: Provides a GUI to facilitate creating/editing a Vim colorscheme
 " Maintainer:       Erik Falor <ewfalor@gmail.com>
-" Date:             Feb 11, 2008
-" Version:          1.0.2 beta
+" Date:             Apr 12, 2008
+" Version:          1.1
 " License:          Vim license
+
+" History: {{{
 "
-" History:
+"   Version 1.1             Added Features:
+"                           Color swatch displayed in TreeView along with hex
+"                           triplet
+"                           Display rgb.txt colors database in an auxiliary
+"                           window
+"                           Foreground and background color combinations for
+"                           each highlight group are analysed for readability.
 "
 "   Version 1.0.2 beta:     Wasn't launching GUI in background on Unix systems
 "                           Fixed a segfault in the TreeView on the PyGTK side.
-"   Version 1.0 beta:       Initial upload
 "
-" Usage Notes:
+"   Version 1.0 beta:       Initial upload
+"}}}
 
 " Initialization: {{{
 if exists("g:loaded_colorschemeeditor")
@@ -131,8 +139,42 @@ endfunction "}}}
 function! CSE_ShowHelp() "{{{
     help ColorSchemeEditor
 endfunction"}}}
+
+function! CSE_FindRgbTxt() "{{{
+    "read rgb.txt, return dictionary mapping color names to hex triplet
+    let rgbtxt = ''
+    if exists("g:rgbtxt") && filereadable(g:rgbtxt)
+        let rgbtxt = g:rgbtxt
+    else
+        if has("win32") || has("win64")
+            let rgbtxt = expand("$VIMRUNTIME/rgb.txt")
+        elseif filereadable("/usr/X11R6/lib/X11/rgb.txt")
+            let rgbtxt = "/usr/X11R6/lib/X11/rgb.txt"
+        elseif filereadable("/usr/share/X11/rgb.txt")
+            let rgbtxt = "/usr/share/X11/rgb.txt"
+        endif
+    endif
+    return rgbtxt
+endfunction "}}}
 "}}}
 
+function! CSE_FindRgbTxt() "{{{
+    "read rgb.txt, return dictionary mapping color names to hex triplet
+    if exists("g:rgbtxt") && filereadable(g:rgbtxt)
+        return g:rgbtxt
+    else
+        if has("win32") || has("win64")
+            return expand("$VIMRUNTIME/rgb.txt")
+        elseif filereadable("/usr/X11R6/lib/X11/rgb.txt")
+            return "/usr/X11R6/lib/X11/rgb.txt"
+        elseif filereadable("/usr/share/X11/rgb.txt")
+            return "/usr/share/X11/rgb.txt"
+        endif
+    endif
+    return ""
+endfunction "}}}
+
+" Launch the editor
 function! <SID>ColorSchemeEditor () "{{{
     if has('gui_running') && has('clientserver')
         if has('gui_win32') 
@@ -142,7 +184,7 @@ function! <SID>ColorSchemeEditor () "{{{
                 exe 'silent !start python "' . s:CSE_Path . '" ' . v:servername .
                             \' "' . fnamemodify( s:CSE_Path, ':h') . '"'
             else
-                exe 'silent !start python "' . s:CSE_Path . '" '. v:servername .
+                exe 'silent ! start python "' . s:CSE_Path . '" '. v:servername .
                             \' "' . fnamemodify( s:CSE_Path, ':h') . '"'
             endif
         elseif has('unix')
